@@ -28,8 +28,9 @@ npx -y skills ls -g --json 2>/dev/null
 ls ~/.codex/skills/.system/ 2>/dev/null
 
 # Hermes 专属技能（canonical 软链之外的独立实体）
-ls -d ~/.hermes/skills/*/ 2>/dev/null | while read d; do
-  [ -L "$d" ] || basename "$d"
+for d in ~/.hermes/skills/*/; do
+  b="${d%/}"; [ "${b##*/}" = ".system" ] && continue
+  [ -L "${d%/}" ] || echo "${d%/}"
 done
 ```
 
