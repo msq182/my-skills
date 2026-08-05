@@ -24,17 +24,19 @@ npx -y skills ls -g --json 2>/dev/null
 这些技能不在 canonical，属于特定 agent 独占，只列不评：
 
 ```bash
-# ZCode 的 Codex 官方技能（OpenAI 系统技能）
-ls ~/.zcode/skills/ 2>/dev/null | grep -v '^\.'   # 其中 canonical 软链外的即隔离技能
+# ZCode 的 Codex 官方技能（OpenAI 系统技能，实体在 ~/.codex/skills/.system/）
+ls ~/.codex/skills/.system/ 2>/dev/null
 
-# Hermes 专属技能（含回归的 hermes-desktop-plugins/hermes-themes）
+# Hermes 专属技能（canonical 软链之外的独立实体）
 ls -d ~/.hermes/skills/*/ 2>/dev/null | while read d; do
   [ -L "$d" ] || basename "$d"
 done
 ```
 
-- 隔离层 = agent 目录中**非 canonical 软链**的技能：ZCode 下 imagegen/openai-docs/plugin-creator/review-agent/skill-creator/skill-installer（Codex 官方），Hermes 下 hermes-desktop-plugins/hermes-themes 及其它独立实体。
-- 这类技能只归本 agent 用，不纳入 canonical，输出时标注"隔离层，非共享"。
+- 隔离层判定：**canonical 实体（`ls -d ~/.agents/skills/*/`）之外的 agent 独立技能**。
+- ZCode 下 imagegen/openai-docs/plugin-creator/review-agent/skill-creator/skill-installer 是 Codex 官方 system 技能（实体 `~/.codex/skills/.system/`，zcode 软链引用），**不要动**。
+- Hermes 下 hermes-desktop-plugins/hermes-themes 及 apple/email/creative 等是其专属实体（`~/.hermes/skills/`），不纳入 canonical。
+- 这类技能只归本 agent 用，输出时标注"隔离层，非共享"。
 
 ### 3. 项目级技能
 
