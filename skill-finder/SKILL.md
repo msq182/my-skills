@@ -15,7 +15,7 @@ description: 按能力需求在技能体系中找现成方案。当用户描述�
 
 ### 第 1 层：本地技能库排查（最快，必做）
 
-**1a. canonical 全局技能（42 个，`~/.agents/skills/`）**
+**1a. canonical 全局技能（46 个实体，`~/.agents/skills/`）**
 
 ```bash
 cd ~/.agents/skills && grep -l "SKILL.md" */SKILL.md 2>/dev/null | xargs grep -i "关键词1\|关键词2\|同义词" --include="SKILL.md" -l 2>/dev/null
@@ -32,6 +32,7 @@ done | grep -i "关键词"
 
 - 用能力相关的多个同义词搜（中文+英文，如"邮件"/"email"/"mail"）。
 - 命中后**直接读该 SKILL.md 确认能力匹配**，不要只看名字。
+- **注意区分实体 vs 软链**：canonical 里 `cua-driver` 是软链（→ `~/.cua-driver/skills/`，官方托管，不走 npx skills 管理/update）。匹配到它时如实告知用户这是外部托管技能，能力以 `cua-driver` 二进制为准。
 
 **1b. 项目级技能（月付清单 `.agents/skills/`）**
 
@@ -64,6 +65,7 @@ npx -y skills find <关键词>
   - 判断该技能能否跨 agent 用（纯指令/调外部工具 → 可入 canonical；绑特定 agent → 隔离层）
   - 通用技能：`npx -y skills add <source> --skill '*' -g -a claude-code -a codex -a opencode -a grok -a qoder -a trae-cn -a reasonix -a zcode -a hermes-agent -a kimi-code-cli -a codebuddy`
   - 若 `ls -g` 计数与 canonical 不一致，以 `ls -d ~/.agents/skills/*/` 为准（lock 路径跟 `$XDG_STATE_HOME`）
+  - **特殊形态：自带二进制/官方安装器的技能**（如 cua-driver 走 `cua-driver skills install`）通常自带分发机制，优先走官方安装而非 npx skills，装完在 catalog 标注"官方托管"。
 
 ### 第 3 层：建议自研（本地和市场都没有时）
 
