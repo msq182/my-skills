@@ -1,59 +1,74 @@
 ---
 name: novel-downloader
-description: 下载网络小说全文（支持番茄小说等站点）到本地 TXT/EPUB。当用户需要下载某本小说、抓取小说全文、把在线小说导出为电子书、或者对小说网站内容做离线保存时使用。
+description: 下载网络小说全文到本地 TXT/EPUB。支持番茄小说（免登录）、起点中文网（需 cookie）及约 90 个笔趣阁镜像站（覆盖七猫等平台的连载书），可跨站搜索书名定位书籍。当用户需要下载某本小说、抓取小说全文、把在线小说导出为电子书、或对小说网站内容做离线保存时使用。
 ---
 
 # novel-downloader
 
-基于 `ying-ck/fanqienovel-downloader`（AGPL-3.0）的本地封装，修复了上游两个会导致失败的问题后，用无交互命令行方式下载网络小说全文。
+基于 `saudadez21/novel-downloader`（PyPI `novel-downloader`，MIT）的多站下载封装，无交互命令行，支持搜索、下载、导出。
 
-## 底层位置
+## 底层与依赖
 
-- 工具源码：`~/tools/fanqienovel-downloader/`（git clone 的上游仓库）
-- venv：`~/tools/fanqienovel-downloader/.venv/`
-- 包装脚本：本文件同目录 `fanqie.py`
+- 后端：`novel-downloader` Python 包（需要 Python 3.11+，本机用 python3.12）
+- venv：`~/tools/novel-downloader/.venv/`
+- 包装脚本：本文件同目录 `nb_dl.py`
+- 配置文件：本文件同目录 `settings.toml`（数据目录在 `~/tools/novel-downloader/data/`）
 
-## 修复记录（重要，勿回退）
+## 站点覆盖
 
-上游 `main.py` 在当前环境下有两个问题，`fanqie.py` 已规避：
+| 站点 | 标识符 | 说明 |
+| --- | --- | --- |
+| 番茄小说 | `fanqienovel` | 免登录直接下载，支持按书 ID / 书籍页 URL |
+| 起点中文网 | `qidian` | 需要登录 cookie（配置见下），支持搜索 |
+| 笔趣阁镜像 | `shuhaige`/`n71ge`/`biquguo`/`quanben5`/`n23qb`/`yibige` 等约 90 个 | 覆盖七猫、起点老书等在镜像站有收录的书籍 |
 
-1. **`_init_cookie` 暴力猜 cookie 循环会卡死**：`_get_new_cookie()` 在 `range(6e18, 9e18)` 里随机尝试 `novel_web_id`，首次无 `data/cookie.json` 时会长时间空转。修复：`build_downloader()` 里用 `curl_cffi.Session` 先访问一次目录页建立会话，然后 `main.req = session`，cookie 置空，跳过整个 cookie 猜测流程。
-2. **旧 Chrome/93 UA 被风控**：上游 `headers_lib` 用的 UA 与 curl_cffi 的 `impersonate="chrome"` 指纹不一致会被拦截（返回空正文）。修复：把 `headers_lib` 改为 `Mozilla/5.0`，让 curl_cffi 自己管理 TLS 指纹。
-
-注意：构建 downloader 用了 `NovelDownloader.__new__` + 手动补属性，绕过 `__init__`（因为它会触发 `_init_cookie`）。**属性清单必须补全**（`CODE`、`charset`、`headers_lib`、`config`、`data_dir` 系列、`zj/cs/tcs/tzj/book_json_path`），否则运行时报 AttributeError。
+> 不同镜像站覆盖面不同：老书（如《盘龙》）用 `shuhaige`、`quanben5`；七猫连载新书多用 `n71ge`、`biquguo`、`shuhaige`。单站找不到时用 `search` 跨站找，命中后直接拿书 ID 下载。
 
 ## 用法
 
-### 搜索书籍
+### 1. 跨站搜索（推荐先做这步）
 
 ```bash
-~/tools/fanqienovel-downloader/.venv/bin/python ~/.agents/skills/novel-downloader/fanqie.py search "<关键词>"
+~/tools/novel-downloader/.venv/bin/python ~/.agents/skills/novel-downloader/nb_dl.py search "<书名>" [-l 20]
 ```
 
-> ⚠️ 搜索 API（`api5-normal-lf.fqnovel.com/reading/bookapi/search`）当前返回 `PARAM_INVALID`，**搜索功能基本不可用**。核心下载不受影响：直接用书籍 ID 或目录页链接即可。
+返回各站命中结果，格式 `[站点] 书名 | 作者 | id=xxx | 书籍页URL`。搜索过程部分镜像站会报 `Failed to fetch HTML`，属正常（那些站抓取失败），不影响其他站的命中。
 
-### 下载整本小说
+### 2. 下载并导出
 
 ```bash
-~/tools/fanqienovel-downloader/.venv/bin/python ~/.agents/skills/novel-downloader/fanqie.py download "<书籍ID 或 目录页完整链接>" \
-  --out <输出目录> \
-  --format txt|epub|both   # 默认 both
-  --split                  # 分章保存为多文件（默认整本一个 txt）
-  --threads 16             # 并发线程数
+~/tools/novel-downloader/.venv/bin/python ~/.agents/skills/novel-downloader/nb_dl.py download <site> <book_id或URL> \
+  --format txt|epub|both \
+  --out <输出目录>
 ```
 
-- 默认输出目录：`~/Downloads/novels/`
-- 书籍 ID 可从番茄小说网页版目录页 URL 提取：`https://fanqienovel.com/page/<ID>`，也可直接传完整链接。
+- `<site>` 传 `auto` 且 target 传书籍页 URL 时自动识别站点
+- 例：`download shuhaige 67304 --format both --out ~/Downloads/小说`
+- 例：`download auto https://fanqienovel.com/page/7276384138653862966 --format epub`
 
-### 输出产物
+### 3. 仅导出已下载缓存
 
-- `--format txt`：整本 `《书名》.txt`（`--split` 则按章存目录）
-- `--format epub`：`《书名》.epub`，含作者、封面、目录导航
-- 中途缓存：`~/tools/fanqienovel-downloader/src/data/bookstore/<书名>.json`（章节级断点续传数据）
+```bash
+... download <site> <book_id> --export-only --out <输出目录>
+```
 
-## 注意事项
+已下载章节缓存在 `~/tools/novel-downloader/data/raw/<site>/<id>/`，重下同一本书秒级完成（走缓存）。
 
-- **风控随机失败**：请求偶发返回空正文导致某章失败或 EPUB/TXT 整本 `err`。wrapper 已对整本下载加 3 次自动重试（`_download_with_retry`），已有缓存章节会自动复用；重试仍失败时再手动重跑。下载超大书籍（千章级）耗时可达 20-30 分钟，**应后台运行并轮询**，不要同步等待。
-- 输出 TXT 时 `fanqie.py` 会自动清理上游 `_save_single_txt` 误写入正文头部的 `_metadata` 段。
-- 首次运行会自动创建 `~/tools/fanqienovel-downloader/src/data/`。
-- 免责：仅供个人学习与阅读使用，抓取付费/VIP 内容有版权风险，请自行斟酌。
+## 起点 cookie 配置
+
+起点免费章节也需要登录。在 `settings.toml` 的 `[sites.qidian]` 下添加：
+
+```toml
+[sites.qidian]
+login_required = true
+cookie = "浏览器登录后复制的完整 Cookie 字符串"
+```
+
+获取方式：浏览器登录 qidian.com → F12 开发者工具 → Network → 任意请求的 Request Headers → 复制 Cookie 全文。
+
+## 已知限制
+
+- 起点、部分镜像站有反爬，偶发请求失败会自动重试（默认 3 次）；大批量章节下载较慢（千章约 5-10 分钟），建议后台运行。
+- 起点付费章节默认不下载（`fetch_inaccessible=false`），仅免费章节。
+- 镜像站覆盖面不一：部分冷门老书可能所有站都无收录，此时如实告知用户搜不到，不强行编造。
+- 版权提示：起点/番茄为正版付费平台，下载仅限个人阅读；笔趣阁等镜像站为盗版转载，使用注意合规风险。
