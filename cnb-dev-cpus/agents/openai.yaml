@@ -1,0 +1,3 @@
+interface:
+  display_name: "CNB 云开发核数切换"
+  short_description: "调整 CNB 云开发环境 CPU 核数并同步启动按钮配置"

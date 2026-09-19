@@ -1,0 +1,3 @@
+interface:
+  display_name: "CNB + GitHub 发布"
+  short_description: "将项目发布到 CNB 并同步 GitHub 镜像"
