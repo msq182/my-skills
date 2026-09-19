@@ -1,0 +1,4 @@
+interface:
+  display_name: "CNB Electron Preview"
+  short_description: "Preview Electron UI in CNB without local dependencies"
+  default_prompt: "Use $cnb-electron-preview to open and verify the latest Electron renderer through CNB."

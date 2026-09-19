@@ -1,0 +1,4 @@
+interface:
+  display_name: "Project Space Governance"
+  short_description: "Use CNB-first Electron previews and save local space"
+  default_prompt: "Use $project-space-governance to develop and preview Electron work in CNB first, while safely reducing local storage."
