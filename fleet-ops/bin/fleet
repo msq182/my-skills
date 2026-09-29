@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""fleet — 跨机执行薄层。
+
+分工（刻意不重叠）：
+  网易UU远程 CLI (uuyc-cli)  →  设备发现 + 人工兜底
+  本机 SSH                   →  实际执行
+
+用法：
+  fleet list              机器清单 + 双状态（UU远程在线 / SSH 可达）
+  fleet doctor            全链路诊断（UU远程主程序 → 设备 → SSH）
+  fleet run <host> <cmd>  在远端执行命令（保持本机 stdio，可管道）
+  fleet open <host>       兜底：打开悠悠远程终端，人工接管
+  fleet hosts             只看配置清单
+
+配置：~/.config/fleet/hosts.json
+退出码：0 成功 / 1 上游失败 / 2 用法错误
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+CONFIG_PATH = os.path.expanduser("~/.config/fleet/hosts.json")
+
+# uuyc-cli 业务错误码 → 人话（来自官方 CLI 参考）
+UUYC_ERRORS = {
+    1001: "主程序未登录，请先在 UU远程 客户端登录",
+    1002: "连不上 UU远程 主程序，请先打开客户端",
+    1003: "CLI 与主程序版本不匹配",
+    1004: "参数无效",
+    1005: "操作失败 / 列表为空，稍后重试",
+    1006: "设备未找到",
+    1007: "网络错误",
+    1008: "名称匹配到多个设备",
+    1010: "设备离线，或验证码格式错误",
+    1012: "本机协助 ID 暂未就绪",
+    1020: "被控端未开启被控功能",
+}
+
+
+# ---------- 基础 ----------
+
+def die(msg, code=1):
+    print("fleet: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        die("找不到配置 " + CONFIG_PATH, 2)
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except json.JSONDecodeError as exc:
+        die("配置格式错误 %s: %s" % (CONFIG_PATH, exc), 2)
+
+
+def sh(cmd, timeout=30):
+    """跑一条命令，返回 (rc, stdout, stderr)。不抛异常。"""
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, errors="replace"
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "超时（%ss）" % timeout
+    except FileNotFoundError:
+        return 127, "", "找不到命令: %s" % cmd[0]
+
+
+# ---------- UU远程（发现层 / 兜底层） ----------
+
+def uuyc(cfg, *args, timeout=20):
+    """调用 uuyc-cli，返回 (data, error)。
+
+    官方 CLI 的业务失败可能仍以退出码 0 结束，所以必须看 .success。
+    """
+    cli = cfg.get("uuyc_cli", "uuyc-cli")
+    if not (os.path.exists(cli) or shutil.which(cli)):
+        return None, "找不到 uuyc-cli（配置为 %s）" % cli
+
+    rc, out, err = sh([cli] + list(args), timeout=timeout)
+
+    try:
+        payload = json.loads(out)
+    except (json.JSONDecodeError, ValueError):
+        return None, (err.strip() or out.strip() or "退出码 %s" % rc)
+
+    if not payload.get("success"):
+        e = payload.get("error") or {}
+        code = e.get("code")
+        hint = UUYC_ERRORS.get(code)
+        msg = "[%s] %s" % (code, e.get("message", "未知错误"))
+        return None, msg + ("  → " + hint if hint else "")
+
+    return payload.get("data") or {}, None
+
+
+def uuyc_devices(cfg):
+    data, err = uuyc(cfg, "device", "list")
+    if err:
+        return None, err
+    return {d.get("deviceId"): d for d in data.get("devices", [])}, None
+
+
+# ---------- SSH（执行层） ----------
+
+def ssh_probe(alias, cfg, timeout=None):
+    t = timeout or cfg.get("ssh_timeout", 6)
+    rc, _, err = sh(
+        [
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=%d" % t,
+            "-o", "StrictHostKeyChecking=no",
+            alias,
+            "exit 0",
+        ],
+        timeout=t + 5,
+    )
+    if rc == 0:
+        return True, ""
+    last = [ln for ln in err.strip().splitlines() if ln.strip()]
+    return False, (last[-1] if last else "退出码 %s" % rc)
+
+
+# ---------- 子命令 ----------
+
+def cmd_list(cfg):
+    devices, derr = uuyc_devices(cfg)
+    if derr:
+        print("⚠ UU远程 设备列表不可用：%s" % derr)
+        print("  （SSH 层仍可单独使用：fleet run <host> ...）\n")
+
+    rows = []
+    for name in sorted(cfg["hosts"]):
+        h = cfg["hosts"][name]
+        alias = h.get("ssh_alias", name)
+
+        if devices is None:
+            uu = "?"
+        else:
+            d = devices.get(h.get("uuyc_device_id", ""))
+            if d is None:
+                uu = "未登记"
+            else:
+                uu = "在线" if d.get("isOnline") else "离线"
+
+        ok, _ = ssh_probe(alias, cfg)
+        rows.append((name, uu, "可达" if ok else "不通", h.get("role", "")))
+
+    w = max([len(r[0]) for r in rows] + [4])
+    print("%-*s  %-6s  %-6s  %s" % (w, "主机", "UU远程", "SSH", "角色"))
+    print("-" * (w + 26))
+    for name, uu, ssh, role in rows:
+        print("%-*s  %-6s  %-6s  %s" % (w, name, uu, ssh, role))
+
+    if any(r[1] == "离线" for r in rows) or any(r[2] == "不通" for r in rows):
+        print("\n有机器不可用 → fleet doctor 看原因")
+
+
+def cmd_doctor(cfg):
+    print("fleet doctor — 全链路诊断\n")
+    problems = []
+
+    # 1. UU远程 主程序
+    data, err = uuyc(cfg, "status")
+    if err:
+        print("1. UU远程 主程序 ........ ✗ %s" % err)
+        problems.append("UU远程 主程序不可用")
+    else:
+        print("1. UU远程 主程序 ........ ✓ %s" % data.get("appVersion", "?"))
+        if not data.get("isLoggedIn"):
+            print("   └ 未登录 ............ ✗")
+            problems.append("UU远程 未登录")
+        if data.get("networkStatus") != "connected":
+            print("   └ 网络 .............. ✗ %s" % data.get("networkStatus"))
+            problems.append("UU远程 网络异常")
+
+    # 2. 设备清单
+    devices, derr = uuyc_devices(cfg)
+    if derr:
+        print("2. 设备清单 ............. ✗ %s" % derr)
+        devices = {}
+    else:
+        print("2. 设备清单 ............. ✓ 共 %d 台" % len(devices))
+
+    # 3. 逐台
+    print("3. 各主机")
+    for name in sorted(cfg["hosts"]):
+        h = cfg["hosts"][name]
+        did = h.get("uuyc_device_id", "")
+        alias = h.get("ssh_alias", name)
+
+        d = devices.get(did)
+        if devices:
+            if d is None:
+                uu = "✗ 未登记（deviceId 过期？）"
+                problems.append("%s 的 deviceId 在 UU远程 里找不到" % name)
+            elif not d.get("isOnline"):
+                uu = "✗ 离线"
+                problems.append("%s 在 UU远程 显示离线" % name)
+            else:
+                uu = "✓ 在线"
+        else:
+            uu = "? 未知"
+
+        ok, msg = ssh_probe(alias, cfg)
+        ssh = "✓ 可达" if ok else "✗ %s" % msg
+        if not ok:
+            problems.append("%s SSH 不通" % name)
+
+        print("   %-9s UU远程 %-24s SSH %s" % (name, uu, ssh))
+        if not ok:
+            print("   %-9s   └ 兜底：fleet open %s" % ("", name))
+
+    print()
+    if not problems:
+        print("结论：全链路正常 ✓")
+        return 0
+    print("结论：发现 %d 个问题" % len(problems))
+    for p in problems:
+        print("  - " + p)
+    return 1
+
+
+def cmd_run(cfg, host, argv):
+    if host not in cfg["hosts"]:
+        die("未知主机 %s（可选：%s）" % (host, ", ".join(sorted(cfg["hosts"]))), 2)
+    if not argv:
+        die("用法: fleet run <host> <命令...>", 2)
+
+    alias = cfg["hosts"][host].get("ssh_alias", host)
+    # 不加引号：整串交给远端 shell 解析（与 `ssh host <cmd>` 行为一致）
+    cmd = " ".join(argv)
+
+    ok, msg = ssh_probe(alias, cfg)
+    if not ok:
+        # SSH 不通时，不干巴巴报错，指向 UU远程 兜底
+        die(
+            "%s SSH 不通：%s\n"
+            "  可能的原因：UU远程 端口映射未启用 / 远端 sshd 没跑\n"
+            "  兜底：fleet open %s   （打开悠悠远程终端人工接管）"
+            % (host, msg, host)
+        )
+
+    proc = subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", alias, cmd])
+    return proc.returncode
+
+
+def cmd_open(cfg, host):
+    if host not in cfg["hosts"]:
+        die("未知主机 %s（可选：%s）" % (host, ", ".join(sorted(cfg["hosts"]))), 2)
+    did = cfg["hosts"][host].get("uuyc_device_id")
+    if not did:
+        die("%s 没配 uuyc_device_id，无法用悠悠远程兜底" % host)
+
+    _, err = uuyc(cfg, "term", did)
+    if err:
+        die("打开悠悠远程终端失败：%s" % err)
+    print("已请求打开悠悠远程终端 → %s（在 UU远程 窗口里接管）" % host)
+    return 0
+
+
+def cmd_hosts(cfg):
+    for name in sorted(cfg["hosts"]):
+        h = cfg["hosts"][name]
+        print("%s  [%s]" % (name, h.get("role", "-")))
+        print("  deviceId : %s" % h.get("uuyc_device_id", "-"))
+        print("  ssh      : %s" % h.get("ssh_alias", name))
+        if h.get("notes"):
+            print("  备注     : %s" % h["notes"])
+    return 0
+
+
+# ---------- 入口 ----------
+
+USAGE = __doc__.strip()
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+
+    action, rest = argv[0], argv[1:]
+    cfg = load_config()
+
+    if action == "list":
+        cmd_list(cfg)
+        return 0
+    if action == "doctor":
+        return cmd_doctor(cfg)
+    if action == "run":
+        if not rest:
+            die("用法: fleet run <host> <命令...>", 2)
+        return cmd_run(cfg, rest[0], rest[1:])
+    if action == "open":
+        if not rest:
+            die("用法: fleet open <host>", 2)
+        return cmd_open(cfg, rest[0])
+    if action == "hosts":
+        return cmd_hosts(cfg)
+
+    die("未知子命令 %s（试试 fleet --help）" % action, 2)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
