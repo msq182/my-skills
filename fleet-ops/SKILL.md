@@ -56,7 +56,8 @@ description: 跨机执行纪律。当任务需要跑到 Mac Mini 或 Windows 上
 | 症状 | 先查 | 处理 |
 |---|---|---|
 | 报「UU远程 主程序不可用」 | `fleet doctor` 第 1 行 | 打开 UU远程 客户端 / 登录 |
-| UU远程 在线但 SSH 不通 | 端口映射是否还启用 | GUI 里检查映射规则；或 `fleet open` 兜底 |
+| UU远程 在线但 SSH 显示 `Connection refused` | 本机映射端口没有监听；映射规则可能尚未重新建立 | 在 UU远程 设备列表选中目标设备，打开「端口映射」页，等对应 SSH 规则显示「成功」，再运行 `fleet doctor`。打开映射页会触发该设备的映射连接恢复；先不要删除或重建规则 |
+| 映射页显示「成功」但 SSH 仍不通 | 远端 sshd 或映射目标异常 | 确认规则目标是 `127.0.0.1:22`，再检查远端 sshd；需要人工接管时用 `fleet open <host>` |
 | 主机显示「未登记」 | deviceId 是否过期 | 更新 `hosts.json` 的 `uuyc_device_id` |
 | 远端报「找不到命令」 | Windows 是不是 cmd 语法 | 显式调 `powershell` |
 

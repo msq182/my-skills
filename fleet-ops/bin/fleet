@@ -127,6 +127,19 @@ def ssh_probe(alias, cfg, timeout=None):
     return False, (last[-1] if last else "退出码 %s" % rc)
 
 
+def is_port_refused(message):
+    return "Connection refused" in message or "actively refused" in message
+
+
+def ssh_hint(host, message):
+    if is_port_refused(message):
+        return (
+            "本机映射端口没有监听。请在 UU远程 打开 %s 设备的「端口映射」页，"
+            "等待该 SSH 规则显示「成功」，再重试。" % host
+        )
+    return "SSH 未连通；可检查 UU远程 设备在线状态和端口映射，或用 fleet open %s 人工接管。" % host
+
+
 # ---------- 子命令 ----------
 
 def cmd_list(cfg):
@@ -215,7 +228,7 @@ def cmd_doctor(cfg):
 
         print("   %-9s UU远程 %-24s SSH %s" % (name, uu, ssh))
         if not ok:
-            print("   %-9s   └ 兜底：fleet open %s" % ("", name))
+            print("   %-9s   └ %s" % ("", ssh_hint(name, msg)))
 
     print()
     if not problems:
@@ -239,13 +252,7 @@ def cmd_run(cfg, host, argv):
 
     ok, msg = ssh_probe(alias, cfg)
     if not ok:
-        # SSH 不通时，不干巴巴报错，指向 UU远程 兜底
-        die(
-            "%s SSH 不通：%s\n"
-            "  可能的原因：UU远程 端口映射未启用 / 远端 sshd 没跑\n"
-            "  兜底：fleet open %s   （打开悠悠远程终端人工接管）"
-            % (host, msg, host)
-        )
+        die("%s SSH 不通：%s\n  %s" % (host, msg, ssh_hint(host, msg)))
 
     proc = subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", alias, cmd])
     return proc.returncode
