@@ -9,6 +9,7 @@
 用法：
   fleet list              机器清单 + 双状态（UU远程在线 / SSH 可达）
   fleet doctor            全链路诊断（UU远程主程序 → 设备 → SSH）
+  fleet repair <host>     SSH 映射端口拒绝连接时，尝试在 UU远程 重连映射
   fleet run <host> <cmd>  在远端执行命令（保持本机 stdio，可管道）
   fleet open <host>       兜底：打开悠悠远程终端，人工接管
   fleet hosts             只看配置清单
@@ -22,6 +23,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 CONFIG_PATH = os.path.expanduser("~/.config/fleet/hosts.json")
 
@@ -134,10 +136,36 @@ def is_port_refused(message):
 def ssh_hint(host, message):
     if is_port_refused(message):
         return (
-            "本机映射端口没有监听。请在 UU远程 打开 %s 设备的「端口映射」页，"
-            "等待该 SSH 规则显示「成功」，再重试。" % host
+            "本机映射端口没有监听。尝试 `fleet repair %s` 自动恢复；"
+            "若失败，再在 UU远程 检查该设备的「端口映射」页。" % host
         )
     return "SSH 未连通；可检查 UU远程 设备在线状态和端口映射，或用 fleet open %s 人工接管。" % host
+
+
+def open_mapping_page(host_name):
+    """用 macOS 系统自带的辅助功能脚本打开指定设备的映射页，不改规则。"""
+    script = r'''on run argv
+    set targetName to item 1 of argv
+    tell application "System Events"
+        if not (exists process "UU远程") then error "UU远程 未运行"
+        tell process "UU远程"
+            set frontmost to true
+            set mainWindow to first window whose name is ""
+            set sidebar to UI element 6 of UI element 1 of mainWindow
+            if not (exists (static text targetName of sidebar)) then error "设备不在 UU远程 主窗口列表中: " & targetName
+            click (static text targetName of sidebar)
+            delay 0.3
+            set mappingControls to UI element 8 of UI element 1 of mainWindow
+            if not (exists (static text "端口映射" of mappingControls)) then error "当前设备没有可用的端口映射入口"
+            click (static text "端口映射" of mappingControls)
+        end tell
+    end tell
+    return "已打开 " & targetName & " 的端口映射页"
+end run'''
+    rc, out, err = sh(["osascript", "-e", script, host_name], timeout=15)
+    if rc != 0:
+        return False, (err.strip() or out.strip() or "辅助功能自动化失败")
+    return True, out.strip()
 
 
 # ---------- 子命令 ----------
@@ -240,6 +268,46 @@ def cmd_doctor(cfg):
     return 1
 
 
+def cmd_repair(cfg, host):
+    if host not in cfg["hosts"]:
+        die("未知主机 %s（可选：%s）" % (host, ", ".join(sorted(cfg["hosts"]))), 2)
+    if sys.platform != "darwin":
+        die("fleet repair 的 UU远程界面恢复目前只支持 macOS", 2)
+
+    alias = cfg["hosts"][host].get("ssh_alias", host)
+    ok, msg = ssh_probe(alias, cfg)
+    if ok:
+        print("%s SSH 已可达，无需恢复映射 ✓" % host)
+        return 0
+    if not is_port_refused(msg):
+        die("%s 不是本机映射端口拒绝连接，未触碰 UU远程：%s" % (host, msg))
+
+    device = cfg["hosts"][host].get("uuyc_device_name")
+    if not device:
+        die("%s 缺少 uuyc_device_name；请填入 UU远程设备列表里的准确名称" % host, 2)
+    opened, detail = open_mapping_page(device)
+    if not opened:
+        die(
+            "%s 打开端口映射页失败：%s\n"
+            "  请确认 UU远程 已运行并允许辅助功能控制；没有更改或重建映射规则。" % (host, detail)
+        )
+    print(detail)
+
+    for _ in range(8):
+        ok, msg = ssh_probe(alias, cfg, timeout=2)
+        if ok:
+            print("%s SSH 已恢复 ✓" % host)
+            return 0
+        if not is_port_refused(msg):
+            break
+        time.sleep(2)
+
+    die(
+        "%s 映射页已打开，但 SSH 尚未恢复：%s\n"
+        "  请确认映射状态为「成功」；本命令不会切换、删除或重建规则。" % (host, msg)
+    )
+
+
 def cmd_run(cfg, host, argv):
     if host not in cfg["hosts"]:
         die("未知主机 %s（可选：%s）" % (host, ", ".join(sorted(cfg["hosts"]))), 2)
@@ -277,6 +345,7 @@ def cmd_hosts(cfg):
         h = cfg["hosts"][name]
         print("%s  [%s]" % (name, h.get("role", "-")))
         print("  deviceId : %s" % h.get("uuyc_device_id", "-"))
+        print("  UU名称   : %s" % h.get("uuyc_device_name", "-"))
         print("  ssh      : %s" % h.get("ssh_alias", name))
         if h.get("notes"):
             print("  备注     : %s" % h["notes"])
@@ -301,6 +370,10 @@ def main(argv):
         return 0
     if action == "doctor":
         return cmd_doctor(cfg)
+    if action == "repair":
+        if not rest:
+            die("用法: fleet repair <host>", 2)
+        return cmd_repair(cfg, rest[0])
     if action == "run":
         if not rest:
             die("用法: fleet run <host> <命令...>", 2)

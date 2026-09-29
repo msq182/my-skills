@@ -22,7 +22,7 @@ description: 跨机执行纪律。当任务需要跑到 Mac Mini 或 Windows 上
 ## 铁律
 
 1. **动远端之前先 `fleet doctor`**。它一次回答三件事：UU远程主程序在不在、设备在不在线、SSH 通不通。
-2. **不要在脚本里硬编码 IP / 端口**。机器清单唯一来源是 `~/.config/fleet/hosts.json`，用 `fleet hosts` 查看。
+2. **不要在脚本里硬编码 IP / 端口**。机器清单唯一来源是 `~/.config/fleet/hosts.json`，用 `fleet hosts` 查看；`uuyc_device_name` 填 UU远程列表里的准确设备名，供 `repair` 定位界面。
 3. **不要绕过 `fleet` 直接 `ssh`**，会丢掉 UU远程 那层的诊断和兜底提示。
 4. **远端不做重复安装**。Mac Mini 是裸机；Windows 已装 Node / Codex 桌面版。
 5. **终端里 `uuyc-cli term` 不能当执行接口**——它只开窗口、不回传输出。要执行就用 `fleet run`。
@@ -33,6 +33,7 @@ description: 跨机执行纪律。当任务需要跑到 Mac Mini 或 Windows 上
 |---|---|
 | `fleet list` | 机器清单 + 双状态（UU远程在线 / SSH 可达） |
 | `fleet doctor` | 全链路诊断，出问题第一步 |
+| `fleet repair <host>` | 本机映射端口拒绝连接时，打开对应设备映射页并等待 SSH 恢复 |
 | `fleet run <host> "<命令>"` | 在远端执行 |
 | `fleet open <host>` | SSH 不通时的兜底：开悠悠远程终端人工接管 |
 | `fleet hosts` | 查看机器清单 |
@@ -41,7 +42,9 @@ description: 跨机执行纪律。当任务需要跑到 Mac Mini 或 Windows 上
 
 1. 本机能做的 → **本机做**，不要为了"用上通道"而外派
 2. 必须远端跑的 → `fleet run <host> "..."`
-3. SSH 不通 → `fleet open <host>` 人工接管；**不要**去改端口映射或重装 sshd
+3. SSH 显示 `Connection refused` → `fleet repair <host>` 自动尝试恢复本机映射；其他 SSH 故障用 `fleet open <host>` 人工接管；**不要**去改端口映射或重装 sshd
+
+`fleet repair <host>` 只在本机映射端口拒绝连接时操作 UU远程：它打开该设备的「端口映射」页并重试 SSH，不会切换、删除或重建规则。需要 macOS 图形会话和允许辅助功能控制 UU远程；若客户端未运行、登录/网络异常或自动化权限不足，命令会停止并要求人工处理。其他 SSH 错误不会触发 UI 操作。
 
 ## 两台机器的脾气
 
@@ -56,7 +59,7 @@ description: 跨机执行纪律。当任务需要跑到 Mac Mini 或 Windows 上
 | 症状 | 先查 | 处理 |
 |---|---|---|
 | 报「UU远程 主程序不可用」 | `fleet doctor` 第 1 行 | 打开 UU远程 客户端 / 登录 |
-| UU远程 在线但 SSH 显示 `Connection refused` | 本机映射端口没有监听；映射规则可能尚未重新建立 | 在 UU远程 设备列表选中目标设备，打开「端口映射」页，等对应 SSH 规则显示「成功」，再运行 `fleet doctor`。打开映射页会触发该设备的映射连接恢复；先不要删除或重建规则 |
+| UU远程 在线但 SSH 显示 `Connection refused` | 本机映射端口没有监听；映射规则可能尚未重新建立 | 运行 `fleet repair <host>`；失败时在 UU远程 设备列表选中目标设备，打开「端口映射」页，等对应 SSH 规则显示「成功」，再运行 `fleet doctor`。先不要删除或重建规则 |
 | 映射页显示「成功」但 SSH 仍不通 | 远端 sshd 或映射目标异常 | 确认规则目标是 `127.0.0.1:22`，再检查远端 sshd；需要人工接管时用 `fleet open <host>` |
 | 主机显示「未登记」 | deviceId 是否过期 | 更新 `hosts.json` 的 `uuyc_device_id` |
 | 远端报「找不到命令」 | Windows 是不是 cmd 语法 | 显式调 `powershell` |
