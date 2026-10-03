@@ -584,7 +584,7 @@ def cmd_doctor(cfg, auto_repair=True):
         for name, reason in recovery_candidates:
             print("   %s：%s" % (name, reason))
             state, detail = perform_mapping_repair(cfg, name)
-            marker = "✓" if state == "recovered" else "✗"
+            marker = "✓" if state in ("recovered", "healthy") else "✗"
             print("   %s %s" % (marker, detail))
         print()
 
@@ -679,6 +679,9 @@ def cmd_repair(cfg, host):
 
     print("%s；正在恢复映射。" % detail)
     state, detail = perform_mapping_repair(cfg, host)
+    if state == "healthy":
+        print("%s SSH 已恢复，无需点击映射 ✓" % host)
+        return 0
     if state == "recovered":
         print(detail)
         return 0
