@@ -910,7 +910,7 @@ def cmd_agent_submit(cfg, host, args):
         "submittedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     worker_b64 = base64.b64encode(REMOTE_AGENT_WORKER_PS.encode("utf-8")).decode("ascii")
-script = r'''$ErrorActionPreference = "Stop"
+    script = r'''$ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
 try {
