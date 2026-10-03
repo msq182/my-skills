@@ -364,6 +364,16 @@ def open_mapping_page(host_name):
     tell application "System Events"
         if not (exists process "UU远程") then error "UU远程 未运行"
         tell process "UU远程"
+            set frontmost to true
+            -- UU may leave the host card behind a remote-screen tab. The
+            -- Window menu's app item returns to the device card where the
+            -- port-mapping button lives.
+            try
+                click menu item "网易UU远程" of menu 1 of menu bar item "窗口" of menu bar 1
+            on error
+                error "无法从 UU远程 当前标签返回设备卡片"
+            end try
+            delay 0.3
             set targetLabel to missing value
             repeat with attempt from 1 to 5
                 set frontmost to true
