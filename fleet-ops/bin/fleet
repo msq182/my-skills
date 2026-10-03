@@ -9,7 +9,8 @@
 
 用法：
   fleet list              机器清单 + UU在线 / 映射规则 / SSH 状态
-  fleet doctor            分层诊断（UU设备 → 映射规则 → 监听 → SSH banner → 命令）
+  fleet doctor            分层诊断；确认是本机映射故障时自动恢复并验证 SSH
+  fleet doctor --check    只诊断，不操作 UU远程界面
   fleet repair <host>     SSH 映射端口拒绝连接时，点击 UU远程 按钮重连映射
   fleet run <host> <cmd>  在远端执行命令（保持本机 stdio，可管道）
   fleet open <host>       兜底：打开悠悠远程终端，人工接管
@@ -278,6 +279,62 @@ def is_connection_timeout(message):
     return "timed out" in lowered or "operation timeout" in lowered or "超时" in message
 
 
+def mapping_repair_plan(alias, cfg):
+    """只为明确的本机映射故障返回可执行恢复计划。"""
+    ok, message = ssh_probe(alias, cfg)
+    if ok:
+        return "healthy", "SSH 已可达"
+
+    refused = is_port_refused(message)
+    timed_out = is_connection_timeout(message)
+    if not refused and not timed_out:
+        return "skip", "SSH 故障不属于映射拒绝/超时：%s" % message
+
+    endpoint, local_forward, listening, endpoint_err = endpoint_probe(alias)
+    if endpoint is None:
+        return "skip", "SSH 入口无法解析：%s" % endpoint_err
+    if not local_forward:
+        return "skip", "SSH 目标 %s 不是本机映射入口" % endpoint
+    if timed_out and (endpoint_err or not listening):
+        return "skip", "SSH 超时但本机映射入口未确认监听：%s" % (endpoint_err or endpoint)
+
+    cause = "本机映射入口拒绝连接" if refused else "SSH 握手超时且本机映射入口仍监听"
+    return "eligible", "%s（入口 %s）" % (cause, endpoint)
+
+
+def perform_mapping_repair(cfg, host):
+    """点击既有端口映射入口并验证 SSH；不改写已保存规则。"""
+    alias = cfg["hosts"][host].get("ssh_alias", host)
+    state, reason = mapping_repair_plan(alias, cfg)
+    if state != "eligible":
+        return state, reason
+    endpoint, _, _, _ = endpoint_probe(alias)
+
+    device = cfg["hosts"][host].get("uuyc_device_name")
+    if not device:
+        return "failed", "%s 缺少 uuyc_device_name" % host
+
+    opened, detail = open_mapping_page(device)
+    if not opened:
+        return "failed", (
+            "%s 打开端口映射页失败：%s；请确认 UU远程 已运行并允许辅助功能控制。"
+            "没有更改或重建映射规则。" % (host, detail)
+        )
+
+    for _ in range(5):
+        ok, message = ssh_probe(alias, cfg, timeout=2)
+        if ok:
+            return "recovered", "%s；%s SSH 已恢复 ✓" % (detail, host)
+        if not is_port_refused(message) and not is_connection_timeout(message):
+            break
+        time.sleep(1)
+
+    return "failed", (
+        "%s 已尝试打开端口映射页，但 SSH 尚未恢复：%s。请确认映射状态为「成功」；"
+        "本命令不会切换、删除或重建规则。" % (host, message)
+    )
+
+
 def ssh_hint(host, message, alias=None):
     if is_port_refused(message) or is_connection_timeout(message):
         _, _, local_forward, _ = ssh_endpoint(alias or host)
@@ -471,8 +528,9 @@ def cmd_list(cfg):
     return 1 if has_problems else 0
 
 
-def cmd_doctor(cfg):
-    print("fleet doctor — 分层诊断（UU远程状态 ≠ 本机映射状态）\n")
+def cmd_doctor(cfg, auto_repair=True):
+    mode = "自动恢复已确认的本机映射故障" if auto_repair else "只诊断，不操作 UU远程界面"
+    print("fleet doctor — 分层诊断（UU远程状态 ≠ 本机映射状态；%s）\n" % mode)
     problems = []
 
     # 1. UU远程 CLI 可见的登录与网络状态
@@ -502,8 +560,36 @@ def cmd_doctor(cfg):
     else:
         print("2. 设备清单 ............. ✓ 共 %d 台" % len(devices))
 
+    # 映射恢复会操作 UU远程 UI。只有本机映射目标、UU 登录和网络正常、
+    # 设备在线且故障特征明确时才点击；其他情况保持诊断，不触碰界面。
+    uu_ready = bool(
+        data
+        and data.get("isLoggedIn")
+        and data.get("networkStatus") == "connected"
+    )
+    recovery_candidates = []
+    if auto_repair and sys.platform == "darwin" and uu_ready and devices is not None:
+        for name in sorted(cfg["hosts"]):
+            host_cfg = cfg["hosts"][name]
+            device = devices.get(host_cfg.get("uuyc_device_id", ""))
+            if not device or not device.get("isOnline"):
+                continue
+            alias = host_cfg.get("ssh_alias", name)
+            state, reason = mapping_repair_plan(alias, cfg)
+            if state == "eligible":
+                recovery_candidates.append((name, reason))
+
+    if recovery_candidates:
+        print("3. 自动恢复（仅确认的本机映射拒绝/超时）")
+        for name, reason in recovery_candidates:
+            print("   %s：%s" % (name, reason))
+            state, detail = perform_mapping_repair(cfg, name)
+            marker = "✓" if state == "recovered" else "✗"
+            print("   %s %s" % (marker, detail))
+        print()
+
     # 3. 分层检查每台设备、映射规则、监听入口、SSH banner 和远端命令。
-    print("3. 各主机")
+    print("%s. 各主机" % (4 if recovery_candidates else 3))
     for name in sorted(cfg["hosts"]):
         h = cfg["hosts"][name]
         did = h.get("uuyc_device_id", "")
@@ -584,53 +670,19 @@ def cmd_repair(cfg, host):
         die("fleet repair 的 UU远程界面恢复目前只支持 macOS", 2)
 
     alias = cfg["hosts"][host].get("ssh_alias", host)
-    ok, msg = ssh_probe(alias, cfg)
-    if ok:
+    state, detail = mapping_repair_plan(alias, cfg)
+    if state == "healthy":
         print("%s SSH 已可达，无需恢复映射 ✓" % host)
         return 0
-    refused = is_port_refused(msg)
-    timed_out = is_connection_timeout(msg)
-    if not refused and not timed_out:
-        die("%s SSH 故障不属于映射拒绝/超时，未触碰 UU远程：%s" % (host, msg))
+    if state != "eligible":
+        die("%s 未触碰 UU远程：%s" % (host, detail))
 
-    endpoint, local_forward, listening, endpoint_err = endpoint_probe(alias)
-    if endpoint is None:
-        die("%s SSH 入口无法解析，未触碰 UU远程：%s" % (host, endpoint_err))
-    if not local_forward:
-        die(
-            "%s 的 SSH 目标 %s 不是本机映射入口，未触碰 UU远程。"
-            "请检查 SSH 配置或目标服务。" % (host, endpoint)
-        )
-    if timed_out and (endpoint_err or not listening):
-        die(
-            "%s SSH 虽然超时，但本机映射入口未能确认正在监听，未触碰 UU远程：%s"
-            % (host, endpoint_err or endpoint)
-        )
-
-    device = cfg["hosts"][host].get("uuyc_device_name")
-    if not device:
-        die("%s 缺少 uuyc_device_name；请填入 UU远程设备列表里的准确名称" % host, 2)
-    opened, detail = open_mapping_page(device)
-    if not opened:
-        die(
-            "%s 打开端口映射页失败：%s\n"
-            "  请确认 UU远程 已运行并允许辅助功能控制；没有更改或重建映射规则。" % (host, detail)
-        )
-    print("%s（入口 %s；正在验证映射是否恢复）" % (detail, endpoint))
-
-    for _ in range(5):
-        ok, msg = ssh_probe(alias, cfg, timeout=2)
-        if ok:
-            print("%s SSH 已恢复 ✓" % host)
-            return 0
-        if not is_port_refused(msg) and not is_connection_timeout(msg):
-            break
-        time.sleep(1)
-
-    die(
-        "%s 已尝试打开端口映射页，但 SSH 尚未恢复：%s\n"
-        "  请确认映射状态为「成功」；本命令不会切换、删除或重建规则。" % (host, msg)
-    )
+    print("%s；正在恢复映射。" % detail)
+    state, detail = perform_mapping_repair(cfg, host)
+    if state == "recovered":
+        print(detail)
+        return 0
+    die(detail)
 
 
 def cmd_run(cfg, host, argv):
@@ -711,7 +763,11 @@ def main(argv):
     if action == "list":
         return cmd_list(cfg)
     if action == "doctor":
-        return cmd_doctor(cfg)
+        if not rest:
+            return cmd_doctor(cfg)
+        if rest == ["--check"]:
+            return cmd_doctor(cfg, auto_repair=False)
+        die("用法: fleet doctor [--check]", 2)
     if action == "repair":
         if not rest:
             die("用法: fleet repair <host>", 2)

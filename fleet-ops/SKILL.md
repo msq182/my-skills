@@ -21,7 +21,7 @@ description: 跨机执行纪律。当任务需要跑到 Mac Mini 或 Windows 上
 
 ## 铁律
 
-1. **动远端之前先 `fleet doctor`**。它分别显示 UU远程 CLI/设备状态、当前打开的映射规则、本机 TCP 监听、SSH banner 和远端命令执行；映射窗口未打开时，规则状态会标为未知，不会为了诊断主动打开或触发连接。
+1. **动远端之前先 `fleet doctor`**。它检查 UU远程 CLI/设备状态、映射规则、本机 TCP 监听、SSH banner 和远端命令；在 macOS 上，如果 UU 已登录且网络正常、目标设备在线，并确认 SSH 本机映射入口拒绝连接，或入口仍监听但 SSH 握手超时，它会自动点击「端口映射」并验证 SSH。`fleet doctor --check` 只诊断，不操作 UU远程界面。
 2. **不要在脚本里硬编码 IP / 端口**。机器清单唯一来源是 `~/.config/fleet/hosts.json`，用 `fleet hosts` 查看；`uuyc_device_name` 填 UU远程列表里的准确设备名，供 `repair` 定位界面。
 3. **不要绕过 `fleet` 直接 `ssh`**，会丢掉 UU远程 那层的诊断和兜底提示。
 4. **远端不做重复安装**。Mac Mini 是裸机；Windows 已装 Node / Codex 桌面版。
@@ -32,7 +32,8 @@ description: 跨机执行纪律。当任务需要跑到 Mac Mini 或 Windows 上
 | 命令 | 用途 |
 |---|---|
 | `fleet list` | 机器清单 + UU在线 / 本机入口 / SSH 状态；任一主机异常时返回非零退出码 |
-| `fleet doctor` | 分层诊断 UU远程、映射规则、本机监听、SSH banner 和远端命令，出问题第一步 |
+| `fleet doctor` | 分层诊断；确认本机映射故障时自动恢复并验证 SSH |
+| `fleet doctor --check` | 只诊断，不操作 UU远程界面 |
 | `fleet repair <host>` | 确认为本机映射入口拒绝连接，或入口仍监听但 SSH 握手超时后，自动点击「端口映射」并验证 SSH 恢复 |
 | `fleet run <host> "<命令>"` | 在远端执行 |
 | `fleet open <host>` | 检查 SSH 状态后打开 UU远程人工接管窗口；CLI 会说明窗口输入边界 |
@@ -42,11 +43,11 @@ description: 跨机执行纪律。当任务需要跑到 Mac Mini 或 Windows 上
 
 1. 本机能做的 → **本机做**，不要为了"用上通道"而外派
 2. 必须远端跑的 → `fleet run <host> "..."`
-3. `fleet doctor` 显示本机映射入口未监听，或入口仍监听但 SSH 握手超时 → `fleet repair <host>` 点击 UU远程设备卡片上的「端口映射」按钮建立会话，并等待 SSH 恢复；它不会修改已保存的规则。其他 SSH 故障用 `fleet open <host>` 人工接管；**不要**去改端口映射或重装 sshd
+3. `fleet doctor` 会在确认本机映射拒绝连接，或入口仍监听但 SSH 握手超时时，自动点击 UU远程设备卡片上的「端口映射」按钮并验证 SSH；它不会修改已保存规则。只有使用 `fleet doctor --check` 后想手动恢复时才需要 `fleet repair <host>`。其他 SSH 故障用 `fleet open <host>` 人工接管；**不要**去改端口映射或重装 sshd
 
 `fleet open <host>` 是明确请求打开 UU远程窗口时的人工兜底，不是命令执行通道。它会先探测 SSH，并在 SSH 可用时提示用 `fleet run` 执行远端命令，但仍会照常打开窗口。UU远程的终端/远控内容不会回传给 CLI，因此 CLI 不能判断窗口当前显示的是密码提示还是 shell，也不能代输。只有窗口明确显示 `Password:` 且说明正在验证被控端身份时，才在 UU远程窗口里输入账户密码；如果看到普通 shell 提示符（如 `%`、`$`、`PS ...>`），说明已经进入终端，不要再输入密码。拿不准时先停下确认，不要把密码输入普通命令行或发到聊天里。
 
-`fleet doctor` 通过 `ssh -G <alias>` 解析 SSH 实际目标，不把本机端口写死。对于 loopback 目标，它分别探测本机 TCP 监听、SSH banner 和实际命令；banner 可判断流量是否到达 SSH 服务，命令探测再确认认证与远端 shell 可用。它只读取当前已打开的 UU 端口映射窗口；窗口未打开时映射规则显示未知，不会主动打开界面或建立会话。UU远程 CLI 的登录、网络和设备在线信息本身不能证明端口转发可用。
+`fleet doctor` 通过 `ssh -G <alias>` 解析 SSH 实际目标，不把本机端口写死。对于 loopback 目标，它分别探测本机 TCP 监听、SSH banner 和实际命令；banner 可判断流量是否到达 SSH 服务，命令探测再确认认证与远端 shell 可用。映射规则状态检查本身只读取当前已打开的 UU 窗口；只有满足上述安全条件时，doctor 才会额外操作 UI 建立映射会话。UU远程 CLI 的登录、网络和设备在线信息本身不能证明端口转发可用。若 UU 状态不正常、设备离线、SSH 目标不是本机映射，或故障类型不是拒绝连接/符合条件的握手超时，doctor 不会点击界面。
 
 SSH 连接使用 `StrictHostKeyChecking=accept-new`：首次连接会记录主机密钥，后续密钥变化会拒绝连接并提示检查，不再跳过主机身份校验。
 
@@ -67,7 +68,7 @@ SSH 连接使用 `StrictHostKeyChecking=accept-new`：首次连接会记录主�
 | 症状 | 先查 | 处理 |
 |---|---|---|
 | 报「UU远程 主程序不可用」 | `fleet doctor` 第 1 行 | 打开 UU远程 客户端 / 登录 |
-| UU远程 在线但 `fleet doctor` 显示入口未监听，或入口监听但 SSH 超时 | 设备在线/入口监听都不能证明 SSH 转发会话有效 | 运行 `fleet repair <host>` 自动点击设备卡片的「端口映射」按钮并验证 SSH；失败时查看页面是否显示「已连接」且 SSH 规则为「成功」。先不要删除或重建规则 |
+| UU远程 在线但映射入口未监听，或入口监听但 SSH 超时 | 设备在线/入口监听都不能证明 SSH 转发会话有效 | 运行 `fleet doctor` 自动点击设备卡片的「端口映射」按钮并验证 SSH；失败时看输出提示及页面状态。先不要删除或重建规则 |
 | 映射页显示「成功」但 SSH 仍不通 | 远端 sshd 或映射目标异常 | 确认规则目标是 `127.0.0.1:22`，再检查远端 sshd；需要人工接管时用 `fleet open <host>` |
 | 主机显示「未登记」 | deviceId 是否过期 | 更新 `hosts.json` 的 `uuyc_device_id` |
 | 远端报「找不到命令」 | Windows 是不是 cmd 语法 | 显式调 `powershell` |
