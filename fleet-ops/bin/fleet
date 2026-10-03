@@ -495,6 +495,7 @@ def cmd_doctor(cfg, auto_repair=True):
         and data.get("networkStatus") == "connected"
     )
     recovery_candidates = []
+    recovery_results = {}
     if auto_repair and sys.platform == "darwin" and uu_ready and devices is not None:
         for name in sorted(cfg["hosts"]):
             host_cfg = cfg["hosts"][name]
@@ -511,6 +512,7 @@ def cmd_doctor(cfg, auto_repair=True):
         for name, reason in recovery_candidates:
             print("   %s：%s" % (name, reason))
             state, detail = perform_mapping_repair(cfg, name)
+            recovery_results[name] = state
             marker = "✓" if state in ("recovered", "healthy") else "✗"
             print("   %s %s" % (marker, detail))
         print()
@@ -578,7 +580,11 @@ def cmd_doctor(cfg, auto_repair=True):
         print("   %-9s SSH banner  %s" % ("", banner))
         print("   %-9s SSH 命令    %s" % ("", command))
         if not banner_ok or not command_ok:
-            print("   %-9s   └ %s" % ("", ssh_hint(name, banner_msg if not banner_ok else command_msg, alias)))
+            if recovery_results.get(name) == "failed":
+                hint = "本轮已点击端口映射但 SSH 仍未恢复；不要重复点击，检查远端 SSH 服务和映射目标。"
+            else:
+                hint = ssh_hint(name, banner_msg if not banner_ok else command_msg, alias)
+            print("   %-9s   └ %s" % ("", hint))
 
     print()
     if not problems:
