@@ -3,13 +3,14 @@
 """fleet — 跨机执行薄层。
 
 分工（刻意不重叠）：
-  网易UU远程 CLI (uuyc-cli)  →  设备发现 + 人工兜底
+  网易UU远程 CLI (uuyc-cli)  →  设备发现
+  UU远程 界面自动点击        →  建立端口映射会话
   本机 SSH                   →  实际执行
 
 用法：
-  fleet list              机器清单 + 双状态（UU远程在线 / SSH 可达）
-  fleet doctor            全链路诊断（UU远程主程序 → 设备 → SSH）
-  fleet repair <host>     SSH 映射端口拒绝连接时，尝试在 UU远程 重连映射
+  fleet list              机器清单 + UU在线 / 映射规则 / SSH 状态
+  fleet doctor            分层诊断（UU设备 → 映射规则 → 监听 → SSH banner → 命令）
+  fleet repair <host>     SSH 映射端口拒绝连接时，点击 UU远程 按钮重连映射
   fleet run <host> <cmd>  在远端执行命令（保持本机 stdio，可管道）
   fleet open <host>       兜底：打开悠悠远程终端，人工接管
   fleet hosts             只看配置清单
@@ -19,8 +20,11 @@
 """
 
 import json
+import ctypes
+import ctypes.util
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -117,11 +121,11 @@ def ssh_probe(alias, cfg, timeout=None):
             "ssh",
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=%d" % t,
-            "-o", "StrictHostKeyChecking=no",
+            "-o", "StrictHostKeyChecking=accept-new",
             alias,
             "exit 0",
         ],
-        timeout=t + 5,
+        timeout=t + 1,
     )
     if rc == 0:
         return True, ""
@@ -129,49 +133,299 @@ def ssh_probe(alias, cfg, timeout=None):
     return False, (last[-1] if last else "退出码 %s" % rc)
 
 
+def ssh_endpoint(alias):
+    """解析 SSH 实际目标；本机 loopback 目标就是映射入口。"""
+    rc, out, err = sh(["ssh", "-G", alias], timeout=5)
+    if rc != 0:
+        return None, None, False, (err.strip() or "ssh -G 退出码 %s" % rc)
+    options = {}
+    for line in out.splitlines():
+        key, _, value = line.partition(" ")
+        if key in ("hostname", "port", "proxycommand", "proxyjump"):
+            options[key] = value.strip()
+    host = options.get("hostname")
+    try:
+        port = int(options.get("port", "22"))
+    except ValueError:
+        return host, None, False, "SSH 配置中的端口无效"
+    local_forward = host in ("127.0.0.1", "localhost", "::1") and not any(
+        options.get(key, "none") not in ("none", "")
+        for key in ("proxycommand", "proxyjump")
+    )
+    return host, port, local_forward, None
+
+
+def endpoint_probe(alias):
+    """检查 ssh alias 的 TCP 入口，并标明是否为本机映射端口。"""
+    host, port, local_forward, err = ssh_endpoint(alias)
+    if err:
+        return None, False, False, err
+    if not host or port is None:
+        return None, False, False, "SSH 配置未解析出 hostname/port"
+    target = "%s:%s" % (host, port)
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            return target, local_forward, True, ""
+    except OSError as exc:
+        return target, local_forward, False, str(exc)
+
+
+def ssh_banner_probe(alias, timeout=3):
+    """直接连 SSH 目标并等待服务器 banner，以验证端口转发端到端工作。"""
+    host, port, local_forward, err = ssh_endpoint(alias)
+    if err:
+        return False, err
+    if not host or port is None:
+        return False, "SSH 配置未解析出 hostname/port"
+
+    rc, out, config_err = sh(["ssh", "-G", alias], timeout=5)
+    if rc != 0:
+        return False, config_err.strip() or "无法读取 SSH 配置"
+    options = {}
+    for line in out.splitlines():
+        key, _, value = line.partition(" ")
+        if key in ("proxycommand", "proxyjump"):
+            options[key] = value.strip()
+    if any(options.get(key, "none") not in ("none", "") for key in options):
+        return False, "SSH 配置使用代理跳板，跳过直连 banner 探测"
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as conn:
+            conn.settimeout(timeout)
+            received = b""
+            deadline = time.monotonic() + timeout
+            while len(received) < 4096 and time.monotonic() < deadline:
+                try:
+                    chunk = conn.recv(512)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                received += chunk
+                for line in received.splitlines():
+                    if line.startswith((b"SSH-2.0-", b"SSH-1.99-")):
+                        return True, "已收到 SSH banner"
+                    if line.startswith(b"SSH-"):
+                        return False, "收到不支持的 SSH banner"
+            if received:
+                return False, "收到数据，但没有有效 SSH banner"
+            return False, "连接成功，但等待 SSH banner 超时或连接被关闭"
+    except OSError as exc:
+        return False, str(exc)
+
+
+def mapping_rule_probe(local_port):
+    """仅读取当前已打开的 UU 端口映射窗口，不打开窗口或触发连接。"""
+    if sys.platform != "darwin":
+        return "unknown", "仅支持在 macOS 读取 UU 窗口"
+    script = r'''on run argv
+    set localPort to item 1 of argv
+    tell application "System Events"
+        if not (exists process "UU远程") then return "unavailable"
+        tell process "UU远程"
+            set mappingWindow to missing value
+            repeat with w in windows
+                try
+                    if (name of w as text) contains "端口映射" then
+                        set mappingWindow to w
+                        exit repeat
+                    end if
+                end try
+            end repeat
+            if mappingWindow is missing value then return "not-open"
+            set elements to entire contents of mappingWindow
+            repeat with i from 1 to count of elements
+                try
+                    set currentElement to item i of elements
+                    set elementRole to role of currentElement as text
+                    set elementValue to value of currentElement as text
+                    if elementRole = "AXStaticText" and elementValue = localPort then
+                        set mappedHost to value of item (i + 1) of elements as text
+                        set mappedPort to value of item (i + 2) of elements as text
+                        set ruleState to value of item (i + 4) of elements as text
+                        if ruleState is "成功" then
+                            return "success|" & mappedHost & "|" & mappedPort
+                        end if
+                        return "failed|" & ruleState & "|" & mappedHost & "|" & mappedPort
+                    end if
+                end try
+            end repeat
+            return "rule-not-found"
+        end tell
+    end tell
+end run'''
+    rc, out, err = sh(["osascript", "-e", script, str(local_port)], timeout=8)
+    if rc != 0:
+        return "unknown", err.strip() or "无法读取 UU 远程映射窗口"
+    result = out.strip().split("|")
+    if result[0] == "success" and len(result) == 3:
+        return "success", "%s:%s，规则成功" % (result[1], result[2])
+    if result[0] == "failed" and len(result) >= 4:
+        return "failed", "%s:%s，状态 %s" % (result[2], result[3], result[1])
+    if result[0] == "not-open":
+        return "unknown", "映射窗口未打开（只读检查未主动打开）"
+    if result[0] == "rule-not-found":
+        return "unknown", "当前映射窗口中没有本机端口 %s 的规则" % local_port
+    return "unknown", "UU 远程界面暂不可读"
+
+
 def is_port_refused(message):
     return "Connection refused" in message or "actively refused" in message
 
 
-def ssh_hint(host, message):
-    if is_port_refused(message):
+def is_connection_timeout(message):
+    lowered = message.lower()
+    return "timed out" in lowered or "operation timeout" in lowered or "超时" in message
+
+
+def ssh_hint(host, message, alias=None):
+    if is_port_refused(message) or is_connection_timeout(message):
+        _, _, local_forward, _ = ssh_endpoint(alias or host)
+        if not local_forward:
+            return "SSH 目标拒绝连接或握手超时；请检查目标服务和 SSH 配置，UU远程映射页不会修复此类故障。"
         return (
-            "本机映射端口没有监听。尝试 `fleet repair %s` 自动恢复；"
-            "若失败，再在 UU远程 检查该设备的「端口映射」页。" % host
+            "本机映射入口拒绝连接或 SSH banner 超时；设备在线和端口监听都不能证明转发有效。"
+            "运行 `fleet repair %s` 自动点击端口映射并验证 SSH。" % host
         )
-    return "SSH 未连通；可检查 UU远程 设备在线状态和端口映射，或用 fleet open %s 人工接管。" % host
+    if "permission denied" in message.lower() or "host key verification failed" in message.lower():
+        return "SSH banner 已到达；请检查远端账号认证或已记录的主机密钥。"
+    return "SSH banner 已到达但远端命令失败；请检查远端账号、shell 和命令权限。"
 
 
 def open_mapping_page(host_name):
-    """用 macOS 系统自带的辅助功能脚本打开指定设备的映射页，不改规则。"""
-    script = r'''on run argv
+    """切到目标设备并点击卡片按钮，触发 UU远程 建立映射会话。"""
+    prepare = r'''on run argv
     set targetName to item 1 of argv
     tell application "System Events"
         if not (exists process "UU远程") then error "UU远程 未运行"
         tell process "UU远程"
-            set frontmost to true
-            set mainWindow to first window whose name is ""
-            set sidebar to UI element 6 of UI element 1 of mainWindow
-            if not (exists (static text targetName of sidebar)) then error "设备不在 UU远程 主窗口列表中: " & targetName
-            click (static text targetName of sidebar)
-            delay 0.3
-            set mappingControls to UI element 8 of UI element 1 of mainWindow
-            if not (exists (static text "端口映射" of mappingControls)) then error "当前设备没有可用的端口映射入口"
-            click (static text "端口映射" of mappingControls)
+            set targetLabel to missing value
+            repeat with attempt from 1 to 5
+                set frontmost to true
+                set mainWindow to first window whose name is ""
+                perform action "AXRaise" of mainWindow
+                delay 0.2
+                set allElements to entire contents of mainWindow
+                repeat with elementRef in allElements
+                    try
+                        set elementRole to role of elementRef as text
+                        set elementValue to value of elementRef as text
+                        if elementRole = "AXStaticText" and elementValue = targetName then
+                            set targetLabel to elementRef
+                            exit repeat
+                        end if
+                    end try
+                end repeat
+                if targetLabel is not missing value then exit repeat
+            end repeat
+            if targetLabel is missing value then error "设备不在 UU远程 主窗口列表中: " & targetName
+            set p to position of targetLabel
+            set s to size of targetLabel
+            return (item 1 of p as text) & "," & (item 2 of p as text) & "," & (item 1 of s as text) & "," & (item 2 of s as text)
         end tell
     end tell
-    return "已打开 " & targetName & " 的端口映射页"
 end run'''
-    rc, out, err = sh(["osascript", "-e", script, host_name], timeout=15)
+    rc, out, err = sh(["osascript", "-e", prepare, host_name], timeout=10)
     if rc != 0:
-        return False, (err.strip() or out.strip() or "辅助功能自动化失败")
-    return True, out.strip()
+        return False, (err.strip() or out.strip() or "读取 UU远程 设备卡片失败")
+    try:
+        x, y, width, height = [float(value.strip()) for value in out.strip().split(",")]
+    except (ValueError, TypeError):
+        return False, "无法读取目标设备卡片坐标：%s" % out.strip()
+
+    def click_at(x, y):
+        core_graphics = ctypes.util.find_library("CoreGraphics")
+        core_foundation = ctypes.util.find_library("CoreFoundation")
+        if not core_graphics or not core_foundation:
+            raise RuntimeError("macOS 图形事件库不可用")
+
+        class CGPoint(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+        cg = ctypes.CDLL(core_graphics)
+        cf = ctypes.CDLL(core_foundation)
+        cg.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+        cg.CGEventCreateMouseEvent.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, CGPoint, ctypes.c_uint32
+        ]
+        cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        point = CGPoint(x, y)
+        for event_type in (1, 2):  # left mouse down / up
+            event = cg.CGEventCreateMouseEvent(None, event_type, point, 0)
+            if not event:
+                raise RuntimeError("创建鼠标事件失败")
+            cg.CGEventPost(0, event)  # kCGHIDEventTap
+            cf.CFRelease(event)
+
+    try:
+        click_at(x + width / 2, y + height / 2)
+    except (OSError, RuntimeError) as exc:
+        return False, "无法点击 UU远程 设备卡片：%s" % exc
+
+    select = r'''on run argv
+    set targetName to item 1 of argv
+    tell application "System Events"
+        tell process "UU远程"
+            set mainWindow to first window whose name is ""
+            set toolbarElements to entire contents of toolbar 1 of mainWindow
+            repeat with elementRef in toolbarElements
+                try
+                    set elementRole to role of elementRef as text
+                    if elementRole = "AXStaticText" then
+                        set elementValue to value of elementRef as text
+                        if elementValue = targetName then return "selected"
+                    end if
+                end try
+            end repeat
+            return "not-selected"
+        end tell
+    end tell
+end run'''
+    time.sleep(0.4)
+    rc, out, err = sh(["osascript", "-e", select, host_name], timeout=10)
+    if rc != 0 or out.strip() != "selected":
+        return False, "点击后没有切换到目标设备 %s：%s" % (host_name, err.strip() or out.strip())
+
+    locate_button = r'''on run argv
+    tell application "System Events"
+        tell process "UU远程"
+            set mainWindow to first window whose name is ""
+            set allElements to entire contents of mainWindow
+            set mappingButton to missing value
+            repeat with elementRef in allElements
+                try
+                    set elementRole to role of elementRef as text
+                    set elementValue to value of elementRef as text
+                    if elementRole = "AXStaticText" and elementValue = "端口映射" then
+                        set mappingButton to elementRef
+                        exit repeat
+                    end if
+                end try
+            end repeat
+            if mappingButton is missing value then error "当前设备没有可用的端口映射入口"
+            set p to position of mappingButton
+            set s to size of mappingButton
+            return (item 1 of p as text) & "," & (item 2 of p as text) & "," & (item 1 of s as text) & "," & (item 2 of s as text)
+        end tell
+    end tell
+end run'''
+    rc, out, err = sh(["osascript", "-e", locate_button], timeout=10)
+    if rc != 0:
+        return False, (err.strip() or out.strip() or "未找到设备卡片上的「端口映射」按钮")
+    try:
+        x, y, width, height = [float(value.strip()) for value in out.strip().split(",")]
+        click_at(x + width / 2, y + height / 2)
+    except (ValueError, TypeError, OSError, RuntimeError) as exc:
+        return False, "无法点击设备卡片上的「端口映射」按钮：%s" % exc
+    return True, "已点击 %s 设备卡片上的「端口映射」按钮" % host_name
 
 
 # ---------- 子命令 ----------
 
 def cmd_list(cfg):
     devices, derr = uuyc_devices(cfg)
+    has_problems = bool(derr)
     if derr:
         print("⚠ UU远程 设备列表不可用：%s" % derr)
         print("  （SSH 层仍可单独使用：fleet run <host> ...）\n")
@@ -189,31 +443,49 @@ def cmd_list(cfg):
                 uu = "未登记"
             else:
                 uu = "在线" if d.get("isOnline") else "离线"
+            if uu != "在线":
+                has_problems = True
 
+        endpoint, local_forward, listening, endpoint_err = endpoint_probe(alias)
+        if endpoint_err:
+            entry = "不可连接" if local_forward else "未知"
+        elif local_forward:
+            entry = "监听" if listening else "未监听"
+        else:
+            entry = "可连" if listening else "不通"
         ok, _ = ssh_probe(alias, cfg)
-        rows.append((name, uu, "可达" if ok else "不通", h.get("role", "")))
+        if local_forward and (endpoint_err or not listening):
+            has_problems = True
+        if not ok:
+            has_problems = True
+        rows.append((name, uu, entry, "可达" if ok else "不通", h.get("role", "")))
 
     w = max([len(r[0]) for r in rows] + [4])
-    print("%-*s  %-6s  %-6s  %s" % (w, "主机", "UU远程", "SSH", "角色"))
-    print("-" * (w + 26))
-    for name, uu, ssh, role in rows:
-        print("%-*s  %-6s  %-6s  %s" % (w, name, uu, ssh, role))
+    print("%-*s  %-6s  %-8s  %-6s  %s" % (w, "主机", "UU远程", "本机入口", "SSH", "角色"))
+    print("-" * (w + 37))
+    for name, uu, entry, ssh, role in rows:
+        print("%-*s  %-6s  %-8s  %-6s  %s" % (w, name, uu, entry, ssh, role))
 
-    if any(r[1] == "离线" for r in rows) or any(r[2] == "不通" for r in rows):
+    if has_problems:
         print("\n有机器不可用 → fleet doctor 看原因")
+    return 1 if has_problems else 0
 
 
 def cmd_doctor(cfg):
-    print("fleet doctor — 全链路诊断\n")
+    print("fleet doctor — 分层诊断（UU远程状态 ≠ 本机映射状态）\n")
     problems = []
 
-    # 1. UU远程 主程序
+    # 1. UU远程 CLI 可见的登录与网络状态
     data, err = uuyc(cfg, "status")
     if err:
         print("1. UU远程 主程序 ........ ✗ %s" % err)
         problems.append("UU远程 主程序不可用")
     else:
-        print("1. UU远程 主程序 ........ ✓ %s" % data.get("appVersion", "?"))
+        print("1. UU远程 CLI ........... ✓ %s / 登录 %s / 网络 %s" % (
+            data.get("appVersion", "?"),
+            "正常" if data.get("isLoggedIn") else "未登录",
+            data.get("networkStatus", "未知"),
+        ))
         if not data.get("isLoggedIn"):
             print("   └ 未登录 ............ ✗")
             problems.append("UU远程 未登录")
@@ -225,19 +497,22 @@ def cmd_doctor(cfg):
     devices, derr = uuyc_devices(cfg)
     if derr:
         print("2. 设备清单 ............. ✗ %s" % derr)
-        devices = {}
+        problems.append("UU远程设备清单读取失败")
+        devices = None
     else:
         print("2. 设备清单 ............. ✓ 共 %d 台" % len(devices))
 
-    # 3. 逐台
+    # 3. 分层检查每台设备、映射规则、监听入口、SSH banner 和远端命令。
     print("3. 各主机")
     for name in sorted(cfg["hosts"]):
         h = cfg["hosts"][name]
         did = h.get("uuyc_device_id", "")
         alias = h.get("ssh_alias", name)
 
-        d = devices.get(did)
-        if devices:
+        if devices is None:
+            uu = "? 未知（清单不可读）"
+        else:
+            d = devices.get(did)
             if d is None:
                 uu = "✗ 未登记（deviceId 过期？）"
                 problems.append("%s 的 deviceId 在 UU远程 里找不到" % name)
@@ -246,17 +521,51 @@ def cmd_doctor(cfg):
                 problems.append("%s 在 UU远程 显示离线" % name)
             else:
                 uu = "✓ 在线"
+        endpoint, local_forward, listening, endpoint_err = endpoint_probe(alias)
+        if local_forward and endpoint:
+            map_state, map_detail = mapping_rule_probe(endpoint.rsplit(":", 1)[-1])
+            if map_state == "success":
+                mapping = "✓ " + map_detail
+            elif map_state == "failed":
+                mapping = "✗ " + map_detail
+                problems.append("%s UU 远程映射规则状态异常" % name)
+            else:
+                mapping = "? " + map_detail
         else:
-            uu = "? 未知"
+            mapping = "? 非本机端口映射目标"
 
-        ok, msg = ssh_probe(alias, cfg)
-        ssh = "✓ 可达" if ok else "✗ %s" % msg
-        if not ok:
-            problems.append("%s SSH 不通" % name)
+        if endpoint_err:
+            entry = "✗ %s 不可连接（%s）" % (endpoint or "SSH 入口", endpoint_err)
+            if local_forward:
+                problems.append("%s 本机映射入口不可连接" % name)
+        elif local_forward:
+            entry = "✓ %s 正在监听" % endpoint if listening else "✗ %s 未监听" % endpoint
+            if not listening:
+                problems.append("%s 本机映射入口未监听" % name)
+        else:
+            entry = "%s %s" % ("✓" if listening else "?", endpoint or "未知")
 
-        print("   %-9s UU远程 %-24s SSH %s" % (name, uu, ssh))
-        if not ok:
-            print("   %-9s   └ %s" % ("", ssh_hint(name, msg)))
+        banner_ok, banner_msg = ssh_banner_probe(alias)
+        if banner_ok:
+            command_ok, command_msg = ssh_probe(alias, cfg)
+        else:
+            command_ok, command_msg = False, "未执行：SSH banner 未到达"
+        if banner_ok:
+            banner = "✓ " + banner_msg
+        else:
+            banner = "✗ " + banner_msg
+            problems.append("%s 未收到 SSH banner" % name)
+        command = "✓ 可执行" if command_ok else "? 未执行（banner未到达）" if not banner_ok else "✗ %s" % command_msg
+        if banner_ok and not command_ok:
+            problems.append("%s SSH 命令不可执行" % name)
+
+        print("   %-9s UU设备      %s" % (name, uu))
+        print("   %-9s 映射规则    %s" % ("", mapping))
+        print("   %-9s 本机端口    %s" % ("", entry))
+        print("   %-9s SSH banner  %s" % ("", banner))
+        print("   %-9s SSH 命令    %s" % ("", command))
+        if not banner_ok or not command_ok:
+            print("   %-9s   └ %s" % ("", ssh_hint(name, banner_msg if not banner_ok else command_msg, alias)))
 
     print()
     if not problems:
@@ -279,8 +588,24 @@ def cmd_repair(cfg, host):
     if ok:
         print("%s SSH 已可达，无需恢复映射 ✓" % host)
         return 0
-    if not is_port_refused(msg):
-        die("%s 不是本机映射端口拒绝连接，未触碰 UU远程：%s" % (host, msg))
+    refused = is_port_refused(msg)
+    timed_out = is_connection_timeout(msg)
+    if not refused and not timed_out:
+        die("%s SSH 故障不属于映射拒绝/超时，未触碰 UU远程：%s" % (host, msg))
+
+    endpoint, local_forward, listening, endpoint_err = endpoint_probe(alias)
+    if endpoint is None:
+        die("%s SSH 入口无法解析，未触碰 UU远程：%s" % (host, endpoint_err))
+    if not local_forward:
+        die(
+            "%s 的 SSH 目标 %s 不是本机映射入口，未触碰 UU远程。"
+            "请检查 SSH 配置或目标服务。" % (host, endpoint)
+        )
+    if timed_out and (endpoint_err or not listening):
+        die(
+            "%s SSH 虽然超时，但本机映射入口未能确认正在监听，未触碰 UU远程：%s"
+            % (host, endpoint_err or endpoint)
+        )
 
     device = cfg["hosts"][host].get("uuyc_device_name")
     if not device:
@@ -291,19 +616,19 @@ def cmd_repair(cfg, host):
             "%s 打开端口映射页失败：%s\n"
             "  请确认 UU远程 已运行并允许辅助功能控制；没有更改或重建映射规则。" % (host, detail)
         )
-    print(detail)
+    print("%s（入口 %s；正在验证映射是否恢复）" % (detail, endpoint))
 
-    for _ in range(8):
+    for _ in range(5):
         ok, msg = ssh_probe(alias, cfg, timeout=2)
         if ok:
             print("%s SSH 已恢复 ✓" % host)
             return 0
-        if not is_port_refused(msg):
+        if not is_port_refused(msg) and not is_connection_timeout(msg):
             break
-        time.sleep(2)
+        time.sleep(1)
 
     die(
-        "%s 映射页已打开，但 SSH 尚未恢复：%s\n"
+        "%s 已尝试打开端口映射页，但 SSH 尚未恢复：%s\n"
         "  请确认映射状态为「成功」；本命令不会切换、删除或重建规则。" % (host, msg)
     )
 
@@ -318,25 +643,43 @@ def cmd_run(cfg, host, argv):
     # 不加引号：整串交给远端 shell 解析（与 `ssh host <cmd>` 行为一致）
     cmd = " ".join(argv)
 
-    ok, msg = ssh_probe(alias, cfg)
-    if not ok:
-        die("%s SSH 不通：%s\n  %s" % (host, msg, ssh_hint(host, msg)))
-
-    proc = subprocess.run(["ssh", "-o", "StrictHostKeyChecking=no", alias, cmd])
+    # One connection avoids a probe/run race; BatchMode and ConnectTimeout
+    # prevent a dead mapping or missing key from hanging an agent run.
+    proc = subprocess.run([
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=%d" % cfg.get("ssh_timeout", 6),
+        "-o", "StrictHostKeyChecking=accept-new",
+        alias,
+        cmd,
+    ])
     return proc.returncode
 
 
 def cmd_open(cfg, host):
     if host not in cfg["hosts"]:
         die("未知主机 %s（可选：%s）" % (host, ", ".join(sorted(cfg["hosts"]))), 2)
-    did = cfg["hosts"][host].get("uuyc_device_id")
+    host_cfg = cfg["hosts"][host]
+    did = host_cfg.get("uuyc_device_id")
     if not did:
         die("%s 没配 uuyc_device_id，无法用悠悠远程兜底" % host)
+
+    alias = host_cfg.get("ssh_alias", host)
+    ssh_ok, ssh_message = ssh_probe(alias, cfg)
+    if ssh_ok:
+        print("%s SSH 通道可用 ✓" % host)
+        print("  要执行命令请用 `fleet run %s <命令>`；仍按请求打开 UU远程窗口。" % host)
+    else:
+        print("%s SSH 暂不可用：%s" % (host, ssh_message))
+        print("  正在打开 UU远程人工接管窗口。")
 
     _, err = uuyc(cfg, "term", did)
     if err:
         die("打开悠悠远程终端失败：%s" % err)
-    print("已请求打开悠悠远程终端 → %s（在 UU远程 窗口里接管）" % host)
+    print("已请求打开 %s 的 UU远程窗口。fleet 无法读取窗口中的提示或判断焦点；请按屏幕内容操作：" % host)
+    print("  • 只有明确看到 Password: 且窗口说明正在验证被控端身份时，才在该窗口输入账户密码。")
+    print("  • 若看到普通 shell 提示符（如 %%、$ 或 PS ...>），表示已进入终端；不要再输入密码。")
+    print("  • 不确定当前状态时先停下，不要把密码发到聊天或输入普通命令行。")
     return 0
 
 
@@ -366,8 +709,7 @@ def main(argv):
     cfg = load_config()
 
     if action == "list":
-        cmd_list(cfg)
-        return 0
+        return cmd_list(cfg)
     if action == "doctor":
         return cmd_doctor(cfg)
     if action == "repair":
