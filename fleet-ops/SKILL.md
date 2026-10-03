@@ -36,6 +36,9 @@ description: 跨机执行纪律。当任务需要跑到 Mac Mini 或 Windows 上
 | `fleet doctor --check` | 只诊断，不操作 UU远程界面 |
 | `fleet repair <host>` | 确认为本机映射入口拒绝连接，或入口仍监听但 SSH 握手超时后，自动点击「端口映射」并验证 SSH 恢复 |
 | `fleet run <host> "<命令>"` | 在远端执行 |
+| `fleet agent submit windows --dir <路径> [--auto] <任务>` | 把任务交给 Windows 上已安装的 OpenCode，后台执行并返回任务 ID |
+| `fleet agent status windows <任务ID>` | 查询任务状态；完成后取回 Agent 回复 |
+| `fleet agent wait windows <任务ID> [--timeout 秒] [--interval 秒]` | 定时轮询，完成后取回 Agent 回复 |
 | `fleet open <host>` | 检查 SSH 状态后打开 UU远程人工接管窗口；CLI 会说明窗口输入边界 |
 | `fleet hosts` | 查看机器清单 |
 
@@ -43,7 +46,20 @@ description: 跨机执行纪律。当任务需要跑到 Mac Mini 或 Windows 上
 
 1. 本机能做的 → **本机做**，不要为了"用上通道"而外派
 2. 必须远端跑的 → `fleet run <host> "..."`
-3. `fleet doctor` 会在确认本机映射拒绝连接，或入口仍监听但 SSH 握手超时时，自动点击 UU远程设备卡片上的「端口映射」按钮并验证 SSH；它不会修改已保存规则。只有使用 `fleet doctor --check` 后想手动恢复时才需要 `fleet repair <host>`。其他 SSH 故障用 `fleet open <host>` 人工接管；**不要**去改端口映射或重装 sshd
+3. 需要远端 Agent 自主处理并回报 → `fleet agent submit windows --dir <Windows项目绝对路径> "<任务>"`，拿到任务 ID 后用 `fleet agent wait` 等待并取回回复
+4. `fleet doctor` 会在确认本机映射拒绝连接，或入口仍监听但 SSH 握手超时时，自动点击 UU远程设备卡片上的「端口映射」按钮并验证 SSH；它不会修改已保存规则。只有使用 `fleet doctor --check` 后想手动恢复时才需要 `fleet repair <host>`。其他 SSH 故障用 `fleet open <host>` 人工接管；**不要**去改端口映射或重装 sshd
+
+## 远端 Agent 派活（当前支持 Windows + OpenCode）
+
+```sh
+fleet agent submit windows --dir 'C:\Users\mason\项目目录' '检查这个项目的启动错误并修复'
+fleet agent status windows <任务ID>
+fleet agent wait windows <任务ID> --timeout 1800 --interval 5
+```
+
+任务经现有 SSH 通道送到 Windows，由已安装的 `opencode run` 在后台执行；fleet 不安装 Agent、不新增模型服务，也不选择免费模型，OpenCode 使用 Windows 上现有的 provider 配置，费用取决于该配置的账户与模型。必须给出绝对项目目录，避免 Agent 在错误目录工作。任务状态、请求和回复保存在 Windows `%LOCALAPPDATA%\fleet\agent-tasks\<任务ID>`；任务 ID 可用于后续查询。当前只实现 Windows/OpenCode，Mac Mini 通道与 Agent CLI 尚未验证。
+
+默认保留 OpenCode 的权限策略。只有明确同意 Agent 自动批准工具操作时，才追加 `--auto`；该选项会把 OpenCode 的 `--auto` 传给远端 Agent。非交互运行遇到需要人工确认的操作时可能失败，使用 `fleet agent status` 查看错误。不要把密码、API key 或其他秘密写进任务内容；请求与回复会留存在远端任务目录。
 
 `fleet open <host>` 是明确请求打开 UU远程窗口时的人工兜底，不是命令执行通道。它会先探测 SSH，并在 SSH 可用时提示用 `fleet run` 执行远端命令，但仍会照常打开窗口。UU远程的终端/远控内容不会回传给 CLI，因此 CLI 不能判断窗口当前显示的是密码提示还是 shell，也不能代输。只有窗口明确显示 `Password:` 且说明正在验证被控端身份时，才在 UU远程窗口里输入账户密码；如果看到普通 shell 提示符（如 `%`、`$`、`PS ...>`），说明已经进入终端，不要再输入密码。拿不准时先停下确认，不要把密码输入普通命令行或发到聊天里。
 
@@ -75,7 +91,7 @@ SSH 连接使用 `StrictHostKeyChecking=accept-new`：首次连接会记录主�
 
 ## 不要做的事
 
-- 不要新建第二套派活通道；跨项目派活仍走 `AI/relay.md`
+- 不要新建第二套跨项目派活/跟踪总线；项目级交接仍走 `AI/relay.md`。`fleet agent` 只负责一次性远端执行、状态轮询和回复取回
 - 不要把 `fleet` 的输出当长报告贴出来——它只回结果和下一步
 - 不要为协作而协作（见 `ops/agent-orchestration.md`：默认单 Agent，外派须能证明总成本更低）
 

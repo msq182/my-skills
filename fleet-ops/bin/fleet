@@ -13,6 +13,10 @@
   fleet doctor --check    只诊断，不操作 UU远程界面
   fleet repair <host>     SSH 映射端口拒绝连接时，点击 UU远程 按钮重连映射
   fleet run <host> <cmd>  在远端执行命令（保持本机 stdio，可管道）
+  fleet agent submit windows --dir <path> [--auto] <task...>
+  fleet agent status windows <task-id>
+  fleet agent wait windows <task-id> [--timeout 秒] [--interval 秒]
+    --auto 显式允许 OpenCode 自动批准工具权限；默认沿用其现有权限策略
   fleet open <host>       兜底：打开悠悠远程终端，人工接管
   fleet hosts             只看配置清单
 
@@ -21,14 +25,18 @@
 """
 
 import json
+import base64
 import ctypes
 import ctypes.util
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import time
+import uuid
+from pathlib import PureWindowsPath
 
 CONFIG_PATH = os.path.expanduser("~/.config/fleet/hosts.json")
 
@@ -425,13 +433,13 @@ end run'''
     tell application "System Events"
         tell process "UU远程"
             set mainWindow to first window whose name is ""
-            set toolbarElements to entire contents of toolbar 1 of mainWindow
-            repeat with elementRef in toolbarElements
+            set allElements to entire contents of mainWindow
+            repeat with elementRef in allElements
                 try
                     set elementRole to role of elementRef as text
                     if elementRole = "AXStaticText" then
                         set elementValue to value of elementRef as text
-                        if elementValue = targetName then return "selected"
+                        if elementValue contains targetName then return "selected"
                     end if
                 end try
             end repeat
@@ -738,6 +746,306 @@ def cmd_open(cfg, host):
     return 0
 
 
+REMOTE_AGENT_WORKER_PS = r'''$ErrorActionPreference = "Stop"
+$utf8 = [System.Text.UTF8Encoding]::new($false)
+$taskDir = $PSScriptRoot
+$requestPath = Join-Path $taskDir "request.json"
+$statusPath = Join-Path $taskDir "status.json"
+$stdoutPath = Join-Path $taskDir "result.txt"
+$request = Get-Content -LiteralPath $requestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$status = [ordered]@{
+  id = $request.id
+  agent = "opencode"
+  state = "running"
+  startedAt = (Get-Date).ToString("o")
+  exitCode = $null
+}
+[System.IO.File]::WriteAllText($statusPath, ($status | ConvertTo-Json -Compress), $utf8)
+try {
+  $agent = Get-Command opencode -ErrorAction Stop
+  $arguments = @("run", "--format", "default", "--dir", [string]$request.cwd)
+  if ($request.auto) { $arguments += "--auto" }
+  $arguments += [string]$request.prompt
+  $agentOutput = (& $agent.Source @arguments 2>&1 | Out-String -Width 4096)
+  $exitCode = $LASTEXITCODE
+  if ($null -eq $exitCode) { $exitCode = 1 }
+  [System.IO.File]::WriteAllText($stdoutPath, $agentOutput, $utf8)
+  $status.state = if ($exitCode -eq 0) { "completed" } else { "failed" }
+  $status.exitCode = $exitCode
+} catch {
+  [System.IO.File]::WriteAllText($stdoutPath, $_.Exception.Message, $utf8)
+  $status.state = "failed"
+  $status.exitCode = 1
+}
+$status.finishedAt = (Get-Date).ToString("o")
+[System.IO.File]::WriteAllText($statusPath, ($status | ConvertTo-Json -Compress), $utf8)
+'''
+
+
+def powershell_encoded(script):
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    return "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand " + encoded
+
+
+def ssh_powershell(alias, cfg, script, input_text=None, timeout=None):
+    command = powershell_encoded(script)
+    try:
+        proc = subprocess.run(
+            [
+                "ssh", "-T",
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=%d" % cfg.get("ssh_timeout", 6),
+                "-o", "StrictHostKeyChecking=accept-new",
+                alias,
+                command,
+            ],
+            input=input_text,
+            capture_output=True,
+            text=True,
+            timeout=timeout or cfg.get("ssh_timeout", 6) + 30,
+            errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        return None, "等待 Windows Agent 通道超时"
+    except FileNotFoundError:
+        return None, "找不到本机 ssh 命令"
+
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "退出码 %s" % proc.returncode
+        return None, detail
+    try:
+        return json.loads(proc.stdout), None
+    except json.JSONDecodeError:
+        return None, "Windows Agent 返回了无法解析的结果：%s" % (proc.stdout.strip() or "空响应")
+
+
+def agent_task_id(value):
+    return bool(re.fullmatch(r"[0-9a-f]{12}", value or ""))
+
+
+def remote_agent_status(alias, cfg, task_id):
+    script = r'''$ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+$id = "TASK_ID_PLACEHOLDER"
+$root = Join-Path $env:LOCALAPPDATA "fleet\agent-tasks"
+$taskDir = Join-Path $root $id
+$statusPath = Join-Path $taskDir "status.json"
+if (!(Test-Path -LiteralPath $statusPath -PathType Leaf)) {
+  [ordered]@{ id = $id; state = "not_found" } | ConvertTo-Json -Compress
+  exit 0
+}
+$status = Get-Content -LiteralPath $statusPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$resultPath = Join-Path $taskDir "result.txt"
+$result = if (Test-Path -LiteralPath $resultPath) { Get-Content -LiteralPath $resultPath -Raw -Encoding UTF8 } else { "" }
+[ordered]@{
+  id = $id
+  agent = $status.agent
+  state = $status.state
+  startedAt = $status.startedAt
+  finishedAt = $status.finishedAt
+  exitCode = $status.exitCode
+  result = $result
+  error = ""
+} | ConvertTo-Json -Compress -Depth 5
+'''.replace("TASK_ID_PLACEHOLDER", task_id)
+    return ssh_powershell(alias, cfg, script)
+
+
+def render_agent_status(status):
+    state = status.get("state", "unknown")
+    state_label = {
+        "queued": "排队中",
+        "running": "运行中",
+        "completed": "已完成",
+        "failed": "失败",
+        "not_found": "不存在",
+    }.get(state, state)
+    print("任务 %s：%s%s" % (
+        status.get("id", "?"),
+        state_label,
+        "（OpenCode）" if status.get("agent") == "opencode" else "",
+    ))
+    if status.get("startedAt"):
+        print("开始：%s" % status["startedAt"])
+    if status.get("finishedAt"):
+        print("结束：%s" % status["finishedAt"])
+    if status.get("result"):
+        label = "Agent 错误" if state == "failed" else "Agent 回复"
+        print("\n--- %s ---\n%s" % (label, status["result"].rstrip()))
+    if status.get("error"):
+        print("\n--- Agent 错误 ---\n%s" % status["error"].rstrip(), file=sys.stderr)
+    return state
+
+
+def cmd_agent_submit(cfg, host, args):
+    if host != "windows":
+        die("第一版 Agent 派活仅支持 windows（OpenCode CLI）；Mac Mini 通道恢复后再接入。", 2)
+    cwd = None
+    auto = False
+    task_parts = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--auto":
+            auto = True
+            i += 1
+        elif args[i] == "--dir":
+            if i + 1 >= len(args):
+                die("--dir 后需要 Windows 项目目录", 2)
+            cwd = args[i + 1]
+            i += 2
+        else:
+            task_parts = args[i:]
+            break
+    prompt = " ".join(task_parts).strip()
+    if not cwd or not PureWindowsPath(cwd).is_absolute() or not prompt:
+        die("用法: fleet agent submit windows --dir <绝对路径> [--auto] <任务...>", 2)
+
+    task_id = uuid.uuid4().hex[:12]
+    request = {
+        "id": task_id,
+        "cwd": cwd,
+        "prompt": prompt,
+        "auto": auto,
+        "submittedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    worker_b64 = base64.b64encode(REMOTE_AGENT_WORKER_PS.encode("utf-8")).decode("ascii")
+script = r'''$ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+try {
+  $payload = [Console]::In.ReadToEnd()
+  $request = $payload | ConvertFrom-Json
+  if ($request.id -notmatch '^[0-9a-f]{12}$') { throw "无效任务 ID" }
+  if (!(Test-Path -LiteralPath $request.cwd -PathType Container)) { throw "项目目录不存在：$($request.cwd)" }
+  if (!(Get-Command opencode -ErrorAction SilentlyContinue)) { throw "Windows 未找到 OpenCode CLI" }
+  $root = Join-Path $env:LOCALAPPDATA "fleet\agent-tasks"
+  $taskDir = Join-Path $root $request.id
+  $null = New-Item -ItemType Directory -Path $taskDir -Force
+  $utf8 = [System.Text.UTF8Encoding]::new($false)
+  [System.IO.File]::WriteAllText((Join-Path $taskDir "request.json"), $payload, $utf8)
+  $worker = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String("WORKER_B64_PLACEHOLDER"))
+  $workerPath = Join-Path $taskDir "worker.ps1"
+  [System.IO.File]::WriteAllText($workerPath, $worker, $utf8)
+  $initial = [ordered]@{ id = $request.id; agent = "opencode"; state = "queued"; submittedAt = $request.submittedAt; exitCode = $null }
+  [System.IO.File]::WriteAllText((Join-Path $taskDir "status.json"), ($initial | ConvertTo-Json -Compress), $utf8)
+  $workerArgs = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $workerPath + '"'
+  $proc = Start-Process -FilePath (Join-Path $PSHOME "powershell.exe") -ArgumentList $workerArgs -WorkingDirectory $request.cwd -WindowStyle Hidden -RedirectStandardOutput (Join-Path $taskDir "worker.stdout.log") -RedirectStandardError (Join-Path $taskDir "worker.stderr.log") -PassThru
+  [System.IO.File]::WriteAllText((Join-Path $taskDir "process.json"), (([ordered]@{ pid = $proc.Id } | ConvertTo-Json -Compress)), $utf8)
+  [ordered]@{ id = $request.id; agent = "opencode"; state = "queued" } | ConvertTo-Json -Compress
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+}
+'''.replace("WORKER_B64_PLACEHOLDER", worker_b64)
+    response, err = ssh_powershell(
+        cfg["hosts"][host].get("ssh_alias", host),
+        cfg,
+        script,
+        input_text=json.dumps(request, ensure_ascii=False),
+    )
+    if err:
+        die("派发到 Windows Agent 失败：%s" % err)
+    print("任务已提交 ✓")
+    print("工具权限自动批准：%s" % ("开启（--auto）" if auto else "关闭（沿用 OpenCode 配置）"))
+    render_agent_status(response)
+    print("查询：fleet agent status windows %s" % task_id)
+    print("等待：fleet agent wait windows %s" % task_id)
+    return 0
+
+
+def cmd_agent_status(cfg, host, task_id):
+    if host != "windows":
+        die("第一版 Agent 派活仅支持 windows（OpenCode CLI）。", 2)
+    if not agent_task_id(task_id):
+        die("任务 ID 格式无效", 2)
+    status, err = remote_agent_status(cfg["hosts"][host].get("ssh_alias", host), cfg, task_id)
+    if err:
+        die("读取 Windows Agent 状态失败：%s" % err)
+    state = render_agent_status(status)
+    if state == "not_found":
+        die("Windows 上找不到任务 %s" % task_id)
+    return 1 if state == "failed" else 0
+
+
+def cmd_agent_wait(cfg, host, args):
+    if host != "windows":
+        die("第一版 Agent 派活仅支持 windows（OpenCode CLI）。", 2)
+    if not args or not agent_task_id(args[0]):
+        die("用法: fleet agent wait windows <task-id> [--timeout 秒] [--interval 秒]", 2)
+    task_id = args[0]
+    timeout = 900
+    interval = 5
+    i = 1
+    while i < len(args):
+        if args[i] not in ("--timeout", "--interval") or i + 1 >= len(args):
+            die("用法: fleet agent wait windows <task-id> [--timeout 秒] [--interval 秒]", 2)
+        flag, value = args[i], args[i + 1]
+        try:
+            seconds = int(value)
+        except ValueError:
+            die("%s 需要正整数秒数" % flag, 2)
+        if seconds <= 0:
+            die("%s 需要正整数秒数" % flag, 2)
+        if flag == "--timeout":
+            timeout = seconds
+        else:
+            interval = seconds
+        i += 2
+
+    alias = cfg["hosts"][host].get("ssh_alias", host)
+    deadline = time.monotonic() + timeout
+    last_state = None
+    while True:
+        status, err = remote_agent_status(alias, cfg, task_id)
+        if err:
+            die("读取 Windows Agent 状态失败：%s" % err)
+        state = status.get("state", "unknown")
+        if state != last_state and state not in ("completed", "failed"):
+            label = {"queued": "排队中", "running": "运行中"}.get(state, state)
+            print("任务 %s：%s" % (task_id, label))
+            last_state = state
+        if state in ("completed", "failed", "not_found"):
+            rendered = render_agent_status(status)
+            if rendered == "not_found":
+                die("Windows 上找不到任务 %s" % task_id)
+            return 1 if rendered == "failed" else 0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print("等待超时；任务仍在后台运行，稍后可再次查询：fleet agent wait windows %s" % task_id)
+            return 1
+        time.sleep(min(interval, remaining))
+
+
+def cmd_agent(cfg, args):
+    if not args:
+        die("用法: fleet agent submit|status|wait ...", 2)
+    action = args[0]
+    rest = args[1:]
+    if action == "submit":
+        if len(rest) < 2:
+            die("用法: fleet agent submit windows --dir <绝对路径> [--auto] <任务...>", 2)
+        host = rest[0]
+        if host not in cfg["hosts"]:
+            die("未知主机 %s（可选：%s）" % (host, ", ".join(sorted(cfg["hosts"]))), 2)
+        return cmd_agent_submit(cfg, host, rest[1:])
+    if action == "status":
+        if len(rest) != 2:
+            die("用法: fleet agent status windows <task-id>", 2)
+        host, task_id = rest
+        if host not in cfg["hosts"]:
+            die("未知主机 %s（可选：%s）" % (host, ", ".join(sorted(cfg["hosts"]))), 2)
+        return cmd_agent_status(cfg, host, task_id)
+    if action == "wait":
+        if len(rest) < 2:
+            die("用法: fleet agent wait windows <task-id> [--timeout 秒] [--interval 秒]", 2)
+        host = rest[0]
+        if host not in cfg["hosts"]:
+            die("未知主机 %s（可选：%s）" % (host, ", ".join(sorted(cfg["hosts"]))), 2)
+        return cmd_agent_wait(cfg, host, rest[1:])
+    die("未知 Agent 操作 %s（可选：submit / status / wait）" % action, 2)
+
+
 def cmd_hosts(cfg):
     for name in sorted(cfg["hosts"]):
         h = cfg["hosts"][name]
@@ -779,6 +1087,8 @@ def main(argv):
         if not rest:
             die("用法: fleet run <host> <命令...>", 2)
         return cmd_run(cfg, rest[0], rest[1:])
+    if action == "agent":
+        return cmd_agent(cfg, rest)
     if action == "open":
         if not rest:
             die("用法: fleet open <host>", 2)
